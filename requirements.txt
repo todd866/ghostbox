@@ -1,0 +1,4 @@
+# Host client uses Python standard library only.
+# Container dependencies (X11, python3-xlib, Pillow, PulseAudio, Google Chrome, noVNC) are installed by box/Dockerfile.
+# Optional (only needed when driving a hardware Pico with --target mac):
+# pyserial>=3.5

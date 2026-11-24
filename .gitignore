@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+gh-runs/
+*.env
+.DS_Store
+ghostbox-smoke/
+ghostbox-20*/
+scratchpad/

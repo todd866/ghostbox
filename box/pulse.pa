@@ -1,0 +1,5 @@
+load-module module-native-protocol-unix socket=/run/pulse-browser/native auth-cookie-enabled=0
+load-module module-null-sink sink_name=speaker sink_properties="device.description='Built-in Audio Analog Stereo'"
+load-module module-null-source source_name=mic description="Built-in Audio Analog Stereo"
+set-default-sink speaker
+set-default-source mic

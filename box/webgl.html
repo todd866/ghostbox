@@ -1,0 +1,55 @@
+<!doctype html><html><head><meta charset="utf-8"><title>fingerprint check</title></head>
+<body style="font:16px/1.4 monospace;padding:24px"><pre id="o">...</pre><script>
+(async () => {
+  const out = [];
+  for (const k of ['webgl2', 'webgl']) {
+    const c = document.createElement('canvas');
+    const g = c.getContext(k);
+    if (!g) { out.push(k + ': none'); continue; }
+    const d = g.getExtension('WEBGL_debug_renderer_info');
+    out.push(k + ': ' + (d ? g.getParameter(d.UNMASKED_VENDOR_WEBGL) + ' | ' + g.getParameter(d.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER)));
+  }
+  const intl = Intl.DateTimeFormat().resolvedOptions();
+  out.push('webdriver ' + navigator.webdriver + ' platform ' + navigator.platform + ' langs ' + JSON.stringify(navigator.languages));
+  out.push('intl locale=' + intl.locale + ' tz=' + intl.timeZone);
+  out.push('cores ' + navigator.hardwareConcurrency + ' mem ' + navigator.deviceMemory + ' dpr ' + devicePixelRatio);
+  out.push('screen ' + screen.width + 'x' + screen.height + ' avail ' + screen.availWidth + 'x' + screen.availHeight + ' outer ' + outerWidth + 'x' + outerHeight + ' inner ' + innerWidth + 'x' + innerHeight);
+  out.push('plugins ' + navigator.plugins.length + ' pdfViewerEnabled ' + navigator.pdfViewerEnabled);
+  out.push('brands ' + JSON.stringify((navigator.userAgentData || {}).brands));
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const counts = {};
+    for (const d of devs) counts[d.kind] = (counts[d.kind] || 0) + 1;
+    out.push('mediaDevices ' + JSON.stringify(counts) + ' total=' + devs.length);
+  } catch (e) {
+    out.push('mediaDevices err=' + e);
+  }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ac = new AC();
+    out.push('audioContext rate=' + ac.sampleRate + ' state=' + ac.state);
+    ac.close();
+  } catch (e) {
+    out.push('audioContext err=' + e);
+  }
+  const ice = await new Promise((resolve) => {
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      const found = [];
+      let done = false;
+      const finish = () => { if (!done) { done = true; try { pc.close(); } catch (_) {} resolve(found); } };
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) return finish();
+        found.push(e.candidate.candidate);
+      };
+      pc.createDataChannel('c');
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => finish());
+      setTimeout(finish, 1500);
+    } catch (e) {
+      resolve(['err:' + e]);
+    }
+  });
+  out.push('webrtc candidates=' + ice.length + ' ' + JSON.stringify(ice));
+  document.getElementById('o').textContent = out.join('\n');
+})();
+</script></body></html>

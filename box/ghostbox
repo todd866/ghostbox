@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# ghostbox: a Linux mini-computer in Docker that browses like a person and does jobs for you.
+#
+#   ghostbox up [--drive]        build + start (--drive: the noVNC viewer can also click/type,
+#                                for signing the box in to sites once; default is watch-only)
+#   ghostbox down                stop (the browser profile, logins and job history are kept)
+#   ghostbox watch               print the viewer URL (carries the box's VNC password)
+#   ghostbox jobs                list jobs and their state
+#   ghostbox show ID             step log, checkpoints, result
+#   ghostbox ok ID | abort ID    answer a job waiting at a checkpoint
+#   ghostbox reset               open a clean tab and close prior tabs
+#   ghostbox vault [list]        list logins stored in the box's vault (no secrets printed)
+#   ghostbox vault add NAME URL [USER]   add a PW_* login (hidden password/TOTP prompt)
+#   ghostbox vault rm NAME...    remove vault login(s)
+#   ghostbox shots ID [DIR]      copy a job's folder out: log, screenshots, files/ (default ./ghostbox-ID)
+#   ghostbox files ID [DIR]      copy the files a job downloaded into a new folder
+#   ghostbox run "goal" [-g ..]  run one job in the foreground
+#
+#   ghostbox do "goal" [-g "guide"] [-n max_steps] [--login NAME]   queue a job, print its id
+#                                (--login: a vault login, from `ghostbox vault add`, this job may use)
+#
+# Brain and eyes are vision LLMs on any OpenAI-compatible API. Settings come from the environment
+# or ~/.config/ghosthands/box.env (KEY=value lines): OPENROUTER_API_KEY for the defaults, or
+# GH_API_KEY + GH_BASE_URL + GH_PLANNER_MODEL + GH_GROUNDER_MODEL (+ GH_LLM_EXTRA) for another
+# provider. They reach the container's environment, never the image.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+C=ghostbox
+compose() { docker compose -f "$HERE/compose.yml" "$@"; }
+jobs_() { docker exec -u ghost "$C" python3 /opt/ghostbox/jobs.py "$@"; }
+box_call() {
+  docker exec -i -u ghost "$C" python3 -c '
+import json, sys, urllib.request
+tok = open("/run/ghostbox/box-token").read().strip()
+req = urllib.request.Request(
+    "http://127.0.0.1:8780/action",
+    data=sys.stdin.buffer.read(),
+    headers={"Content-Type": "application/json", "X-Box-Token": tok},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=20) as r:
+    sys.stdout.write(r.read().decode())
+'
+}
+
+load_env() {  # KEY=value lines, parsed (never run as shell); only known names
+  local f="$HOME/.config/ghosthands/box.env" line k v
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[2]}"; v="${BASH_REMATCH[3]}"
+    case "$k" in OPENROUTER_API_KEY|GH_*|BOX_*|TZ) ;; *) continue;; esac
+    if [[ "$v" =~ ^\'(.*)\'$ ]] || [[ "$v" =~ ^\"(.*)\"$ ]]; then v="${BASH_REMATCH[1]}"; fi
+    export "$k=$v"
+  done < "$f"
+}
+
+load_key() {
+  load_env
+  [ -n "${GH_API_KEY:-}" ] && return 0
+  if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.config/ghosthands/openrouter.env" ]; then
+    OPENROUTER_API_KEY="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?OPENROUTER_API_KEY[[:space:]]*=[[:space:]]*["'\'']?([^"'\'']+).*/\2/p' \
+      "$HOME/.config/ghosthands/openrouter.env" | head -1)"
+  fi
+  export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+  [ -n "$OPENROUTER_API_KEY" ] || echo "note: no OPENROUTER_API_KEY or GH_API_KEY; the box runs, jobs will fail until one is set" >&2
+}
+
+goal_args() {  # "goal" [-g guide] [-n steps] [--login NAME]... -> jobs.py add arguments
+  local goal="$1"; shift; local guide="" n=60; LOGINS=()
+  while [ $# -gt 0 ]; do case "$1" in -g|--guide) guide="$2"; shift 2;; -n|--max-steps) n="$2"; shift 2;;
+    --login) LOGINS+=(--login "$2"); shift 2;;
+    *) echo "unknown option $1" >&2; exit 2;; esac; done
+  ARGS=(--goal "$goal" --guide "$guide" --max-steps "$n")
+}
+
+job_id() { [[ "${1:-}" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || { echo "not a job id: ${1:-}" >&2; exit 2; }; }
+
+quarantine() {  # web downloads keep macOS Gatekeeper's quarantine flag on the Mac
+  command -v xattr >/dev/null || return 0
+  find "$1" -type f -exec xattr -w com.apple.quarantine "0083;$(printf %x "$(date +%s)");ghostbox;" {} + 2>/dev/null || true
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  up)
+    load_key
+    export BOX_VNC_INPUT=0; [ "${1:-}" = "--drive" ] && export BOX_VNC_INPUT=1
+    export BOX_TOKEN="${BOX_TOKEN:-$(openssl rand -hex 16)}"
+    compose up -d --build
+    for _ in $(seq 60); do docker exec -u ghost "$C" python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8780/health')" 2>/dev/null && break; sleep 1; done
+    "$0" watch
+    ;;
+  down) compose down ;;
+  watch) echo "watch: http://localhost:6080/vnc.html?autoconnect=1&resize=scale&password=$(docker exec -u ghost "$C" cat /run/ghostbox/vnc-password)" ;;
+  do) [ $# -ge 1 ] || { echo 'ghostbox do "goal" [-g guide] [--login NAME]' >&2; exit 2; }; goal_args "$@"; jobs_ add "${ARGS[@]}" ${LOGINS[@]+"${LOGINS[@]}"} ;;
+  jobs) jobs_ list ;;
+  show|ok|abort) job_id "${1:-}"; jobs_ "$cmd" "$1" ;;
+  shots)
+    job_id "${1:-}"; out="${2:-./ghostbox-$1}"
+    [ ! -e "$out" ] || [ -z "$(ls -A "$out")" ] || { echo "$out is not empty" >&2; exit 1; }
+    mkdir -p "$out"
+    docker cp "$C:/data/jobs/$1/." "$out/" && quarantine "$out" && echo "$out"
+    ;;
+  files)
+    job_id "${1:-}"
+    # into a new or empty folder only: names come from the web, never overwrite your files
+    out="${2:-./ghostbox-$1-files}"
+    [ ! -e "$out" ] || [ -z "$(ls -A "$out")" ] || { echo "$out is not empty" >&2; exit 1; }
+    mkdir -p "$out"; docker cp "$C:/data/jobs/$1/files/." "$out/" && quarantine "$out" && ls -l "$out"
+    ;;
+  run) goal_args "$@"; docker exec -it -u ghost "$C" gh-run "${ARGS[@]}" --run-dir "/data/runs/$(date -u +%Y%m%d-%H%M%S)" ;;
+  reset) box_call <<<'{"verb":"reset"}'; echo "" ;;
+  vault)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)
+        box_call <<<'{"verb":"vault"}' | python3 -c '
+import json, sys
+for l in json.load(sys.stdin).get("logins", []):
+    print("%-18s %-28s %-20s %s" % (l["name"], l["site"], l["user"], "totp" if l["totp"] else ""))
+'
+        ;;
+      add)
+        [ $# -ge 2 ] || { echo "usage: ghostbox vault add PW_NAME URL [USER]" >&2; exit 2; }
+        name="$1"; url="$2"; user="${3:-}"
+        [[ "$name" == PW_* ]] || { echo "vault name must start with PW_: $name" >&2; exit 2; }
+        if [ -t 0 ]; then
+          [ -n "$user" ] || read -r -p "Username: " user
+          read -rs -p "Password for $name: " pw; echo >&2
+          read -rs -p "TOTP base32 secret (optional, Enter to skip): " totp; echo >&2
+        else
+          IFS= read -r pw || pw=""
+          IFS= read -r totp || totp=""
+        fi
+        printf '%s\n%s\n%s\n%s\n%s\n' "$name" "$url" "$user" "$pw" "$totp" | python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines() + ["", "", "", "", ""]
+name, url, user, pw, totp = lines[:5]
+entry = {"url": url}
+if user: entry["user"] = user
+if pw: entry["value"] = pw
+if totp: entry["totp"] = totp
+print(json.dumps({"verb": "vault_import", "entries": {name: entry}}))
+' | box_call
+        echo ""
+        ;;
+      rm|remove)
+        [ $# -ge 1 ] || { echo "usage: ghostbox vault rm NAME..." >&2; exit 2; }
+        python3 -c 'import json, sys; print(json.dumps({"verb": "vault_remove", "names": sys.argv[1:]}))' "$@" | box_call
+        echo ""
+        ;;
+      *) echo "usage: ghostbox vault [list | add PW_NAME URL [USER] | rm NAME...]" >&2; exit 2 ;;
+    esac
+    ;;
+  *) sed -n '2,/^set /{/set /d;s/^# \{0,1\}//p;}' "$0" ;;
+esac
